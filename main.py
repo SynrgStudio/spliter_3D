@@ -4,8 +4,14 @@ import sys
 import time
 from pathlib import Path
 
-os.environ["QT_API"] = "pyqt6"
-os.environ["QT_OPENGL"] = "desktop"
+os.environ.setdefault("QT_API", "pyqt6")
+
+# VTK/PyVista + Qt is more reliable on Linux through XCB/X11 than native
+# Wayland. Keep these overridable from the shell for troubleshooting.
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+else:
+    os.environ.setdefault("QT_OPENGL", "desktop")
 
 import numpy as np
 import pyvista as pv
