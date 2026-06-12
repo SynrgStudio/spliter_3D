@@ -6,10 +6,12 @@ from pathlib import Path
 
 os.environ.setdefault("QT_API", "pyqt6")
 
-# VTK/PyVista + Qt is more reliable on Linux through XCB/X11 than native
-# Wayland. Keep these overridable from the shell for troubleshooting.
+# VTK/PyVista currently uses vtkXOpenGLRenderWindow, which is more reliable
+# through XCB/XWayland than native Wayland. Some Linux desktops export
+# QT_QPA_PLATFORM=wayland;xcb, so force xcb by default before Qt is imported.
+# For troubleshooting, override with SPLIT3R_QT_QPA_PLATFORM=wayland/xcb/offscreen.
 if sys.platform.startswith("linux"):
-    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.environ["QT_QPA_PLATFORM"] = os.environ.get("SPLIT3R_QT_QPA_PLATFORM", "xcb")
 else:
     os.environ.setdefault("QT_OPENGL", "desktop")
 
