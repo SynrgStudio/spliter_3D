@@ -45,7 +45,7 @@ class MainWindow(QMainWindow):
         panel_layout = QVBoxLayout(panel)
         layout.addWidget(panel)
 
-        self.status = QLabel("Listo. Importá un modelo para empezar.")
+        self.status = QLabel("Listo. Importá un modelo para empezar. LMB click selecciona, Ctrl+LMB borra, LMB drag rota, RMB drag panea. Drag sobre un insert extraído lo mueve.")
         self.status.setWordWrap(True)
         panel_layout.addWidget(self.status)
 
@@ -182,7 +182,9 @@ class MainWindow(QMainWindow):
             self.set_status(f"Error exportando: {exc}")
 
     def export_insert(self) -> None:
-        self._save_mesh(self.last_result.insert if self.last_result else None, "Export insert")
+        moved_insert = self.viewport.transformed_part_mesh(-1)
+        mesh = moved_insert if moved_insert is not None else (self.last_result.insert if self.last_result else None)
+        self._save_mesh(mesh, "Export insert")
 
     def export_body(self) -> None:
         self._save_mesh(self.mesh, "Export body/socket")

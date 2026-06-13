@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pyvista as pv
 import vtk
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -12,9 +13,10 @@ class VtkViewport(QVTKRenderWindowInteractor):
     """Small VTK viewport tailored for the rewrite app.
 
     Controls:
-    - LMB click: smart-select face region
-    - Ctrl + LMB click: erase face region
-    - LMB drag: rotate camera
+    - LMB click on body: smart-select face region
+    - Ctrl + LMB click on body: erase face region
+    - LMB drag on body/empty space: rotate camera
+    - LMB drag on extracted insert: move that insert in the view plane
     - RMB drag: pan camera
     - Mouse wheel: zoom
     """
@@ -36,11 +38,14 @@ class VtkViewport(QVTKRenderWindowInteractor):
         self.actor: vtk.vtkActor | None = None
         self.selection_actor: vtk.vtkActor | None = None
         self.part_actors: list[vtk.vtkActor] = []
+        self.part_meshes: list[pv.PolyData] = []
 
         self._pressed_button: Qt.MouseButton | None = None
         self._press_pos: tuple[float, float] | None = None
         self._last_pos: tuple[float, float] | None = None
         self._press_modifiers = Qt.KeyboardModifier.NoModifier
+        self._drag_part_actor: vtk.vtkActor | None = None
+        self._drag_display_z = 0.0
 
         self.Initialize()
 
@@ -98,20 +103,33 @@ class VtkViewport(QVTKRenderWindowInteractor):
         valid = [i for i in selected if 0 <= i < self.mesh.n_cells]
         if valid:
             selected_mesh = self.mesh.extract_cells(valid).extract_surface(algorithm="dataset_surface").triangulate()
+            selected_mesh = selected_mesh.compute_normals(auto_orient_normals=True, point_normals=True, cell_normals=True)
+            if "Normals" in selected_mesh.point_data:
+                bounds = self.mesh.bounds
+                model_size = max(bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4], 1.0)
+                # Lift the overlay a tiny amount to avoid z-fighting, which made
+                # the selected patch disappear depending on camera angle.
+                selected_mesh.points += selected_mesh.point_data["Normals"] * (model_size * 0.001)
+
             mapper = vtk.vtkPolyDataMapper()
             mapper.SetInputData(selected_mesh)
             mapper.ScalarVisibilityOff()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-4.0, -4.0)
 
             actor = vtk.vtkActor()
             actor.SetMapper(mapper)
             actor.PickableOff()
             prop = actor.GetProperty()
-            prop.SetColor(1.0, 0.55, 0.0)
-            prop.SetAmbient(0.35)
-            prop.SetDiffuse(0.80)
-            prop.SetSpecular(0.08)
-            prop.SetOpacity(0.92)
+            prop.SetColor(1.0, 0.56, 0.0)
+            prop.SetAmbient(0.85)
+            prop.SetDiffuse(0.35)
+            prop.SetSpecular(0.05)
+            prop.SetOpacity(1.0)
             prop.SetInterpolationToPhong()
+            prop.EdgeVisibilityOn()
+            prop.SetEdgeColor(1.0, 0.95, 0.15)
+            prop.SetLineWidth(1.25)
             self.selection_actor = actor
             self.renderer.AddActor(actor)
         self.render()
@@ -129,6 +147,7 @@ class VtkViewport(QVTKRenderWindowInteractor):
         prop.SetSpecular(0.15)
         prop.SetInterpolationToPhong()
         self.part_actors.append(actor)
+        self.part_meshes.append(mesh.copy())
         self.renderer.AddActor(actor)
         self.render()
 
@@ -136,6 +155,8 @@ class VtkViewport(QVTKRenderWindowInteractor):
         for actor in self.part_actors:
             self.renderer.RemoveActor(actor)
         self.part_actors.clear()
+        self.part_meshes.clear()
+        self._drag_part_actor = None
         self.render()
 
     def mousePressEvent(self, event):
@@ -145,6 +166,14 @@ class VtkViewport(QVTKRenderWindowInteractor):
             self._press_pos = pos
             self._last_pos = pos
             self._press_modifiers = event.modifiers()
+            self._drag_part_actor = None
+
+            if event.button() == Qt.MouseButton.LeftButton:
+                picked_actor, _, picked_world = self._pick_actor(pos)
+                if picked_actor in self.part_actors and picked_world is not None:
+                    self._drag_part_actor = picked_actor
+                    self._drag_display_z = self._world_to_display_z(picked_world)
+
             event.accept()
             return
         super().mousePressEvent(event)
@@ -160,7 +189,10 @@ class VtkViewport(QVTKRenderWindowInteractor):
         self._last_pos = pos
 
         if self._pressed_button == Qt.MouseButton.LeftButton:
-            self._rotate_camera(dx, dy)
+            if self._drag_part_actor is not None:
+                self._drag_part(dx, dy)
+            else:
+                self._rotate_camera(dx, dy)
         elif self._pressed_button == Qt.MouseButton.RightButton:
             self._pan_camera(dx, dy)
         event.accept()
@@ -168,9 +200,10 @@ class VtkViewport(QVTKRenderWindowInteractor):
     def mouseReleaseEvent(self, event):
         if self._pressed_button == event.button():
             release_pos = (float(event.position().x()), float(event.position().y()))
-            if self._pressed_button == Qt.MouseButton.LeftButton and self._is_click(release_pos):
+            if self._pressed_button == Qt.MouseButton.LeftButton and self._drag_part_actor is None and self._is_click(release_pos):
                 self._pick(release_pos, erase=bool(self._press_modifiers & Qt.KeyboardModifier.ControlModifier))
             self._pressed_button = None
+            self._drag_part_actor = None
             self._press_pos = None
             self._last_pos = None
             event.accept()
@@ -195,10 +228,57 @@ class VtkViewport(QVTKRenderWindowInteractor):
     def _pick(self, pos: tuple[float, float], erase: bool) -> None:
         if self.actor is None:
             return
+        picked_actor, cell_id, _ = self._pick_actor(pos)
+        if picked_actor == self.actor:
+            self.facePicked.emit(cell_id, erase)
+
+    def _pick_actor(self, pos: tuple[float, float]) -> tuple[vtk.vtkActor | None, int, tuple[float, float, float] | None]:
         x, y = pos[0], self.height() - pos[1]
         self.picker.Pick(float(x), float(y), 0, self.renderer)
-        if self.picker.GetActor() == self.actor:
-            self.facePicked.emit(int(self.picker.GetCellId()), erase)
+        actor = self.picker.GetActor()
+        if actor is None:
+            return None, -1, None
+        picked = self.picker.GetPickPosition()
+        return actor, int(self.picker.GetCellId()), (float(picked[0]), float(picked[1]), float(picked[2]))
+
+    def _world_to_display_z(self, world: tuple[float, float, float]) -> float:
+        self.renderer.SetWorldPoint(world[0], world[1], world[2], 1.0)
+        self.renderer.WorldToDisplay()
+        return float(self.renderer.GetDisplayPoint()[2])
+
+    def _display_to_world(self, x: float, y: float, z: float) -> np.ndarray:
+        self.renderer.SetDisplayPoint(float(x), float(y), float(z))
+        self.renderer.DisplayToWorld()
+        world = self.renderer.GetWorldPoint()
+        if abs(world[3]) <= 1e-12:
+            return np.array(world[:3], dtype=float)
+        return np.array([world[0] / world[3], world[1] / world[3], world[2] / world[3]], dtype=float)
+
+    def _drag_part(self, dx: float, dy: float) -> None:
+        if self._drag_part_actor is None or self._last_pos is None:
+            return
+        current_x, current_y_qt = self._last_pos
+        current_y = self.height() - current_y_qt
+        previous_x = current_x - dx
+        previous_y = current_y + dy
+        world_prev = self._display_to_world(previous_x, previous_y, self._drag_display_z)
+        world_curr = self._display_to_world(current_x, current_y, self._drag_display_z)
+        motion = world_curr - world_prev
+        self._drag_part_actor.AddPosition(float(motion[0]), float(motion[1]), float(motion[2]))
+        self.render()
+
+    def transformed_part_mesh(self, index: int = -1) -> pv.PolyData | None:
+        if not self.part_meshes:
+            return None
+        mesh = self.part_meshes[index].copy()
+        actor = self.part_actors[index]
+        vtk_matrix = actor.GetMatrix()
+        matrix = np.eye(4)
+        for row in range(4):
+            for col in range(4):
+                matrix[row, col] = vtk_matrix.GetElement(row, col)
+        mesh.transform(matrix, inplace=True)
+        return mesh
 
     def _rotate_camera(self, dx: float, dy: float) -> None:
         camera = self.renderer.GetActiveCamera()
